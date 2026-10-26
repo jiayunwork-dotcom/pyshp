@@ -9,6 +9,8 @@ import json
 import os.path
 from pathlib import Path
 import shutil
+import struct
+import zipfile
 
 # third party imports
 import pytest
@@ -2209,5 +2211,270 @@ def test_read_latin1_shapefile_cpg_file(encoding, context, tmp_latin1_shapefile_
     r.close()
     if encoding == "latin1":
         assert rec == [2, u'Ñandú']
+
+
+# ---------------------------------------------------------------------------
+# dBASE III memo fields ('M', stored in a companion .dbt file)
+# ---------------------------------------------------------------------------
+
+MEMO_BLOCK_SIZE = 512
+
+
+def _write_memo_shapefile(target):
+    """Writes a shapefile with two 'M' fields and four records, including
+    blank memos, non-string values and memos spanning several .dbt blocks."""
+    long_text = "X" * 1300
+    unicode_text = "中文 memo — café naïve 😀 " + "y" * 600
+    writer = shapefile.Writer(target, shapeType=shapefile.POINT, autoBalance=True)
+    writer.field("id", "N", size=10, decimal=0)
+    writer.field("note", "M", size=50)  # requested width must be ignored
+    writer.field("other", "C", size=20)
+    writer.field("note2", "M")
+    rows = [
+        (1, "first memo", "a", "second-field memo"),
+        (2, None, "b", long_text),
+        (3, "", "c", unicode_text),
+        (4, 12345, "d", None),  # non-strings are stringified like C fields
+    ]
+    for i, row in enumerate(rows):
+        writer.record(*row)
+        writer.point(i, i)
+    writer.close()
+    return rows, long_text, unicode_text
+
+
+def test_memo_field_is_always_10_bytes(tmp_path):
+    target = tmp_path / "m"
+    with shapefile.Writer(target, shapeType=shapefile.NULL, autoBalance=True) as w:
+        w.field("wide", "M", size=50, decimal=3)
+        assert w.fields[-1].size == 10
+        assert w.fields[-1].decimal == 0
+        w.record("x")
+        w.null()
+    with shapefile.Reader(target) as r:
+        assert [f for f in r.fields if f.name == "wide"][0].size == 10
+        assert r.record(0).wide == "x"
+
+
+def test_memo_roundtrip_via_all_record_access_paths(tmp_path):
+    target = tmp_path / "m"
+    rows, long_text, unicode_text = _write_memo_shapefile(target)
+
+    with shapefile.Reader(target) as r:
+        assert r.record(0).note == "first memo"
+        assert r.record(0).note2 == "second-field memo"
+        recs = r.records()
+        assert recs[1].note is None
+        assert recs[1].note2 == long_text
+        assert recs[2].note is None  # '' and None both read back as None
+        assert recs[2].note2 == unicode_text
+        assert recs[3].note == "12345"
+        assert recs[3].note2 is None
+
+        # iterRecords with start/stop and memo field filtering
+        iter_recs = list(r.iterRecords(start=1, stop=3, fields=["note2"]))
+        assert iter_recs[0].note2 == long_text
+        assert not hasattr(iter_recs[0], "note")
+
+        # shapeRecords and __geo_interface__ expose memo values too
+        assert r.shapeRecords()[1].record.note2 == long_text
+        features = r.__geo_interface__["features"]
+        assert features[3]["properties"]["note"] == "12345"
+        assert features[2]["properties"]["note2"] == unicode_text
+
+
+def test_memo_dbt_on_disk_layout_and_version_byte(tmp_path):
+    target = tmp_path / "m"
+    _write_memo_shapefile(target)
+
+    dbf = target.with_suffix(".dbf").read_bytes()
+    dbt = target.with_suffix(".dbt").read_bytes()
+    # version byte declares dBASE III with memos
+    assert dbf[0] == 0x83
+    # block 0 is the 512-byte file header; first 4 bytes = next free block
+    assert len(dbt) % MEMO_BLOCK_SIZE == 0
+    next_free = struct.unpack("<I", dbt[:4])[0]
+    assert next_free == len(dbt) // MEMO_BLOCK_SIZE
+    assert dbt[4:MEMO_BLOCK_SIZE] == b"\x00" * (MEMO_BLOCK_SIZE - 4)
+    # every memo body is terminated by two 0x1A and padded to a block boundary
+    assert dbt[MEMO_BLOCK_SIZE:].count(b"\x1a\x1a") >= 4
+
+
+def test_memo_dbt_created_for_dbf_path_even_without_records(tmp_path):
+    target = tmp_path / "empty"
+    with shapefile.Writer(dbf=str(target.with_suffix(".dbf"))) as w:
+        w.field("m", "M")
+    dbt = target.with_suffix(".dbt")
+    assert dbt.exists()
+    assert dbt.read_bytes() == struct.pack("<I", 1) + b"\x00" * (
+        MEMO_BLOCK_SIZE - 4
+    )
+    with shapefile.Reader(str(target.with_suffix(".dbf"))) as r:
+        assert len(r) == 0
+        user_fields = [f for f in r.fields if f.name != "DeletionFlag"]
+        assert user_fields == [("m", "M", 10, 0)]
+
+
+def test_memo_no_memo_fields_keeps_old_output(tmp_path):
+    target = tmp_path / "plain"
+    with shapefile.Writer(target, shapeType=shapefile.POINT, autoBalance=True) as w:
+        w.field("id", "N", 10, 0)
+        w.field("name", "C", 20)
+        w.record(1, "abc")
+        w.point(1, 1)
+    assert target.with_suffix(".dbf").read_bytes()[0] == 0x03
+    assert not target.with_suffix(".dbt").exists()
+
+
+def test_memo_missing_dbt_is_lazy_error(tmp_path):
+    target = tmp_path / "m"
+    _write_memo_shapefile(target)
+    target.with_suffix(".dbt").unlink()
+
+    # opening must not fail (same behaviour as a missing .shx)
+    r = shapefile.Reader(target)
+    try:
+        # non-memo fields are still readable ...
+        assert r.record(0, fields=["id", "other"]).other == "a"
+        assert list(r.iterRecords(fields=["id"]))[3].id == 4
+        # ... but touching an 'M' value without .dbt raises
+        with pytest.raises(shapefile.dbfFileException):
+            r.record(0).note
+        with pytest.raises(shapefile.dbfFileException):
+            r.records()
+    finally:
+        r.close()
+
+
+def test_memo_uppercase_extension_is_found(tmp_path):
+    target = tmp_path / "up"
+    _write_memo_shapefile(target)
+    dbt = target.with_suffix(".dbt")
+    dbt.rename(target.with_suffix(".DBT"))
+    with shapefile.Reader(target) as r:
+        assert r.record(0).note == "first memo"
+
+
+def test_memo_zip_contains_and_loads_dbt(tmp_path):
+    src = tmp_path / "m"
+    _write_memo_shapefile(src)
+    archive = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(archive, "w") as z:
+        for ext in (".shp", ".shx", ".dbf", ".dbt"):
+            z.write(src.with_suffix(ext), arcname="m" + ext)
+
+    # full member path ...
+    with shapefile.Reader(str(archive) + "/m.shp") as r:
+        assert r.record(0).note2 == "second-field memo"
+    # ... and archive-only form
+    with shapefile.Reader(archive) as r:
+        assert r.record(0).note == "first memo"
+
+
+def test_memo_writer_requires_sink_for_memo_records():
+    # dbf is an in-memory file object: nowhere to put a sibling .dbt
+    w = shapefile.Writer(dbf=io.BytesIO())
+    w.field("m", "M")
+    with pytest.raises(shapefile.dbfFileException):
+        w.record("content would be lost")
+    # cleanup must not raise the same error again
+    w.close()
+
+
+def test_memo_writer_dbt_file_object_and_ownership():
+    dbf, dbt = io.BytesIO(), io.BytesIO()
+    with shapefile.Writer(dbf=dbf, dbt=dbt) as w:
+        w.field("m", "M")
+        w.record("kept in the caller's stream")
+    # user-supplied file objects stay open and are closed by the user
+    assert not dbf.closed and not dbt.closed
+    dbf.seek(0)
+    dbt.seek(0)
+    with shapefile.Reader(dbf=dbf, dbt=dbt) as r:
+        assert r.record(0).m == "kept in the caller's stream"
+    assert not dbf.closed and not dbt.closed
+    dbf.close()
+    dbt.close()
+
+
+def test_memo_path_writer_closes_dbt(tmp_path):
+    target = tmp_path / "own"
+    w = shapefile.Writer(target, shapeType=shapefile.POINT, autoBalance=True)
+    w.field("m", "M")
+    w.record("x")
+    w.point(0, 0)
+    dbt_file = w.dbf_writer._get_dbt_writer().file
+    assert not dbt_file.closed
+    w.close()
+    assert dbt_file.closed
+
+
+def test_memo_writer_constructor_arguments_conflict(tmp_path):
+    target = tmp_path / "t"
+    with pytest.raises(TypeError):
+        shapefile.Writer(target, dbt=io.BytesIO())
+    _write_memo_shapefile(target)
+    with pytest.raises(TypeError):
+        shapefile.Reader(target, dbt=io.BytesIO())
+    # a dbt stream without a dbf makes no sense
+    with pytest.raises(shapefile.ShapefileException):
+        shapefile.Writer(shp=io.BytesIO(), shapeType=shapefile.NULL,
+                         dbt=io.BytesIO())
+
+
+def test_memo_dbf_package_interop(tmp_path):
+    """PyPI 'dbf' can read memos pyshp writes (and append to the table),
+    and pyshp can read dBASE III memos written by 'dbf'."""
+    dbf = pytest.importorskip("dbf")
+
+    target = tmp_path / "from_pyshp.dbf"
+    long_one = "A" * 1200
+    with shapefile.Writer(dbf=str(target)) as w:
+        w.field("id", "N", 10, 0)
+        w.field("title", "C", 30)
+        w.field("memo1", "M")
+        w.field("memo2", "M")
+        w.record(1, "first", "hello memo", long_one)
+        w.record(2, "second", None, "中文—café")
+    assert target.read_bytes()[0] == 0x83
+
+    table = dbf.Table(str(target), codepage="utf8")
+    table.open(dbf.READ_WRITE)
+    try:
+        rows = list(table)
+        assert rows[0].memo1.strip() == "hello memo"
+        assert rows[0].memo2.strip() == long_one
+        assert rows[1].memo2.strip() == "中文—café"
+        table.append((3, "appended", "new memo from dbf", "B" * 1300))
+    finally:
+        table.close()
+
+    with shapefile.Reader(target) as r:
+        recs = r.records()
+        assert recs[0].memo1 == "hello memo"
+        assert recs[0].memo2 == long_one
+        assert recs[1].memo2 == "中文—café"
+        assert recs[2].memo1 == "new memo from dbf"
+        assert recs[2].memo2 == "B" * 1300
+
+    target2 = tmp_path / "from_dbf.dbf"
+    table = dbf.Table(
+        str(target2), "id N(10,0); title C(30); memo1 M; memo2 M", codepage="utf8"
+    )
+    table.open(dbf.READ_WRITE)
+    try:
+        table.append((10, "ten", "dbf-created memo", "x" * 1100))
+        table.append((11, "eleven", "", "unicode: 中文 😀"))
+    finally:
+        table.close()
+    assert target2.read_bytes()[0] == 0x83
+
+    with shapefile.Reader(target2) as r:
+        recs = r.records()
+        assert recs[0].ID == 10
+        assert recs[0].MEMO1 == "dbf-created memo"
+        assert recs[0].MEMO2 == "x" * 1100
+        assert recs[1].MEMO1 == ""
+        assert recs[1].MEMO2 == "unicode: 中文 😀"
 
 

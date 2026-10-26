@@ -610,6 +610,11 @@ class Field(NamedTuple):
         elif type_ is FieldType.L:
             size = 1
             decimal = 0
+        elif type_ is FieldType.M:
+            # A dBASE III memo field holds a 10-byte pointer into the .dbt file,
+            # regardless of the field width requested by the caller.
+            size = MEMO_FIELD_SIZE
+            decimal = 0
 
         if not strict and " " in name:
             warnings.warn(
@@ -794,6 +799,17 @@ class GeoJSONFeatureCollectionWithBBox(GeoJSONFeatureCollection):
 # Helpers
 
 MISSING = (None, "")  # Don't make a set, as user input may not be Hashable
+
+# dBASE III memo files (.dbt)
+DBF_VERSION = 0x03  # dBASE III without memo fields
+DBF_MEMO_VERSION_FLAG = (
+    0x80  # OR'ed into the .dbf header's version byte when M fields exist
+)
+MEMO_FIELD_SIZE = (
+    10  # A .dbf 'M' field always stores a 10-byte (space padded) block number
+)
+MEMO_BLOCK_SIZE = 512  # .dbt blocks are always 512 bytes; block 0 is the file header
+MEMO_TERMINATOR = b"\x1a\x1a"  # Each memo entry ends with two 0x1A bytes
 ISDATA_LOWER_BOUND = (
     -1e38
 )  # Inclusive.  As per the ESRI shapefile spec, only used for m-values.
@@ -2876,7 +2892,7 @@ class _FileObjChecker(_HasExitStack, Generic[FileProtoT]):
 
     @property
     @abc.abstractmethod
-    def ext(self) -> Literal[".shp", ".shx", ".dbf", None]: ...
+    def ext(self) -> Literal[".shp", ".shx", ".dbf", ".dbt", None]: ...
 
     ExceptionClass = ShapefileException
 
@@ -2956,6 +2972,54 @@ class _HasCheckedReadableFile(_FileObjChecker[ReadSeekableBinStream]):
         return self._ensure_file_obj()
 
 
+class DbtReader:
+    """Reads dBASE III memo text from a .dbt file.
+
+    The .dbt is divided into fixed 512-byte blocks.  Block 0 is a file
+    header; memo entries start at block 1 and each ends with two 0x1A
+    bytes, spanning as many consecutive blocks as needed.  A 'M' field in
+    the .dbf stores the right-justified, space-padded decimal number of
+    the entry's first block.
+
+    DbtReader does not own (and therefore never closes) its file object:
+    the Reader that opened a path-based .dbt registers it on its own exit
+    stack, while file objects handed in by the caller stay caller-owned.
+    """
+
+    def __init__(
+        self,
+        file: ReadSeekableBinStream,
+        *,
+        encoding: str = "utf-8",
+        encodingErrors: str = "strict",
+    ):
+        self.file = file
+        self.encoding = encoding
+        self.encodingErrors = encodingErrors
+
+    def read_memo(self, block: int) -> str:
+        """Returns the memo text stored starting at 'block'."""
+        f = self.file
+        f.seek(block * MEMO_BLOCK_SIZE)
+
+        # Read whole blocks until the two-byte end-of-memo marker is found,
+        # accumulating across block boundaries (the marker may straddle one).
+        data = b""
+        marker_at = -1
+        while marker_at == -1:
+            chunk = f.read(MEMO_BLOCK_SIZE)
+            if not chunk:
+                # Some writers omit the marker in the final block.
+                break
+            data += chunk
+            marker_at = data.find(MEMO_TERMINATOR)
+
+        if marker_at != -1:
+            data = data[:marker_at]
+
+        return data.decode(self.encoding, self.encodingErrors)
+
+
 class DbfReader(_HasCheckedReadableFile):
     """Reads a dbf file's fields and records."""
 
@@ -2971,6 +3035,7 @@ class DbfReader(_HasCheckedReadableFile):
         encoding: str = "utf-8",
         encodingErrors: str = "strict",
         strict: bool = False,
+        dbt: ReadSeekableBinStream | None = None,
     ):
         super().__init__(file=dbf)
 
@@ -2980,6 +3045,14 @@ class DbfReader(_HasCheckedReadableFile):
 
         self.fields: list[Field] = []
         self._fieldLookup: dict[str, int] = {}
+
+        # Optional dBASE III memo file.  May be None if no .dbt was found;
+        # a dbfFileException is only raised if an 'M' value is actually read.
+        self._dbt_reader: DbtReader | None = (
+            DbtReader(dbt, encoding=encoding, encodingErrors=encodingErrors)
+            if dbt is not None
+            else None
+        )
 
         self._dbfHeader()
 
@@ -3092,6 +3165,33 @@ class DbfReader(_HasCheckedReadableFile):
             recLookup = self._fullRecLookup
         return fieldTuples, recLookup, recStruct
 
+    def _read_memo_value(self, value: bytes) -> str | None:
+        """Reads one 'M' field: its 10 bytes hold the right-justified
+        starting block number of the text in the accompanying .dbt file.
+        A blank (all spaces, or block 0) pointer denotes a missing value.
+        Raises dbfFileException if no .dbt was opened.
+        """
+        pointer = value.strip(b" \x00")
+        if not pointer or pointer == b"0":
+            return None
+
+        if self._dbt_reader is None:
+            raise dbfFileException(
+                "Record contains a Memo ('M') field pointing at block "
+                f"{pointer.decode('ascii', 'replace')!r} but no .dbt memo file "
+                "was found or supplied. Pass one in with the 'dbt' keyword, "
+                "or place it next to the .dbf file."
+            )
+
+        try:
+            block = int(pointer)
+        except ValueError:
+            raise dbfFileException(
+                f"Could not parse the memo field's block number: {value!r}"
+            ) from None
+
+        return self._dbt_reader.read_memo(block)
+
     def _record(
         self,
         fieldTuples: list[Field],
@@ -3183,6 +3283,9 @@ class DbfReader(_HasCheckedReadableFile):
                         value = False
                     else:
                         value = None  # unknown value is set to missing
+            elif typ == FieldType.M:
+                # memo: a pointer to text stored in the accompanying .dbt file
+                value = self._read_memo_value(value)
             else:
                 value = _decode_C_or_M_field(
                     value,
@@ -3604,6 +3707,7 @@ class Reader(_HasExitStack):
         shp: _NoShpSentinel | BinaryFileT | None = _NoShpSentinel(),
         shx: BinaryFileT | None = None,
         dbf: BinaryFileT | None = None,
+        dbt: BinaryFileT | None = None,
         cpg: BinaryFileT | None = None,
         # Keep kwargs even though unused, to preserve PyShp 2.4 API
         **kwargs: Any,
@@ -3615,6 +3719,7 @@ class Reader(_HasExitStack):
         self._shp = None
         self._shx = None
         self._dbf = None
+        self._dbt = None
         self._cpg = None
         self.shapeName = "Not specified"
         self.numShapes: int = 0
@@ -3634,6 +3739,8 @@ class Reader(_HasExitStack):
                 discarded_kwargs["shx"] = shx
             if dbf is not None:
                 discarded_kwargs["dbf"] = dbf
+            if dbt is not None:
+                discarded_kwargs["dbt"] = dbt
             if cpg is not None:
                 discarded_kwargs["cpg"] = cpg
             if discarded_kwargs:
@@ -3642,7 +3749,7 @@ class Reader(_HasExitStack):
                     f"Got: {shapefile_path}, plus the following unusable "
                     " kwargs: {discarded_kwargs} which previous versions of PyShp ignored. \n"
                     "Only either: i) exactly one positional arg \n"
-                    "         or: ii) one or both of shp and dbf, optionally plus shx and cpg kwargs\n"
+                    "         or: ii) one or both of shp and dbf, optionally plus shx, dbt and cpg kwargs\n"
                     "is currently supported.  All other kwargs may be set (or not). "
                 )
             self.path = shapefile_path
@@ -3710,6 +3817,7 @@ class Reader(_HasExitStack):
 
         self._cpg = self._seek_0_on_file_obj_wrap_or_open_from_name(".cpg", cpg)
         self._dbf = self._seek_0_on_file_obj_wrap_or_open_from_name(".dbf", dbf)
+        self._dbt = self._seek_0_on_file_obj_wrap_or_open_from_name(".dbt", dbt)
 
         # Load the files
         if self._shp:
@@ -3754,6 +3862,7 @@ class Reader(_HasExitStack):
             dbf=self._dbf,
             encoding=self.encoding,
             encodingErrors=self.encodingErrors,
+            dbt=self._dbt,
         )
 
     @functools.cache
@@ -3870,10 +3979,10 @@ class Reader(_HasExitStack):
     def _try_get_open_constituent_file(
         self,
         file: Path,
-        ext: Literal[".shp", ".shx", ".dbf", ".cpg"],
+        ext: Literal[".shp", ".shx", ".dbf", ".dbt", ".cpg"],
     ) -> IO[bytes] | None:
         """
-        Attempts to open a .shp, .dbf or .shx file,
+        Attempts to open a .shp, .dbf, .dbt or .shx file,
         with both lower case and upper case file extensions,
         and return it.  If it was not possible to open the file, None is returned.
         """
@@ -3890,7 +3999,7 @@ class Reader(_HasExitStack):
 
     def _seek_0_on_file_obj_wrap_or_open_from_name(
         self,
-        ext: Literal[".shp", ".shx", ".dbf", ".cpg"],
+        ext: Literal[".shp", ".shx", ".dbf", ".dbt", ".cpg"],
         file: BinaryFileT | None,
     ) -> None | IO[bytes]:
         if file is None:
@@ -3918,7 +4027,7 @@ class Reader(_HasExitStack):
     def _download_binary_file_from_url(
         self,
         urlinfo: SplitResult,
-        ext: Literal[".shp", ".shx", ".dbf", ".cpg", ".zip"],
+        ext: Literal[".shp", ".shx", ".dbf", ".dbt", ".cpg", ".zip"],
         add_to_exit_stack: bool = True,
         suppress_http_errors: bool = True,
     ) -> tempfile._TemporaryFileWrapper[bytes] | None:
@@ -3942,6 +4051,7 @@ class Reader(_HasExitStack):
         self._shx = self._download_binary_file_from_url(urlinfo, ".shx")
         self._cpg = self._download_binary_file_from_url(urlinfo, ".cpg")
         self._dbf = self._download_binary_file_from_url(urlinfo, ".dbf")
+        self._dbt = self._download_binary_file_from_url(urlinfo, ".dbt")
 
         if self._shp is None and self._dbf is None:
             raise ShapefileException(
@@ -3952,7 +4062,7 @@ class Reader(_HasExitStack):
         self,
         archive: zipfile.ZipFile,
         file: Path,
-        ext: Literal[".shp", ".shx", ".dbf", ".cpg"],
+        ext: Literal[".shp", ".shx", ".dbf", ".dbt", ".cpg"],
     ) -> tempfile._TemporaryFileWrapper[bytes] | None:
         for cased_ext in {ext.lower(), ext.upper(), ext}:
             try:
@@ -4006,7 +4116,7 @@ class Reader(_HasExitStack):
                 constituent_files = (
                     Path(name)
                     for name in archive.namelist()
-                    if name.lower().endswith((".shp", ".dbf", ".shx", ".cpg"))
+                    if name.lower().endswith((".shp", ".dbf", ".dbt", ".shx", ".cpg"))
                 )
 
                 def without_ext(path: Path) -> Path:
@@ -4031,6 +4141,7 @@ class Reader(_HasExitStack):
             self._shx = self._load_file_from_zip_to_tmp_file(archive, shapefile, ".shx")
             self._cpg = self._load_file_from_zip_to_tmp_file(archive, shapefile, ".cpg")
             self._dbf = self._load_file_from_zip_to_tmp_file(archive, shapefile, ".dbf")
+            self._dbt = self._load_file_from_zip_to_tmp_file(archive, shapefile, ".dbt")
 
     def load(self, file: str | os.PathLike[Any]) -> None:
         """Opens a shapefile from a filename or file-like
@@ -4072,6 +4183,16 @@ class Reader(_HasExitStack):
         self._dbf = self._try_get_open_constituent_file(file, ".dbf")
         if self._dbf is not None:
             self._cpg = self._try_get_open_constituent_file(file, ".cpg")
+            self.load_dbt(file)
+
+    def load_dbt(self, file: Path) -> None:
+        """
+        Attempts to load file with .dbt extension as both lower and upper case.
+        A missing .dbt is not an error: opening succeeds, and a dbfFileException
+        is only raised if an 'M' field value is read without one.
+        """
+        self._dbt = self._try_get_open_constituent_file(file, ".dbt")
+        if self._dbf is not None:
             self._get_dbf_reader()
 
     def __len__(self) -> int:
@@ -4271,6 +4392,78 @@ class _HasCheckedWriteableFile(_FileObjChecker[WriteSeekableBinStream]):
         super().close()
 
 
+class DbtWriter(_HasCheckedWriteableFile):
+    """Writes a dBASE III memo file (.dbt) accompanying a .dbf with 'M' fields.
+
+    The file is one 512-byte block 0 header (its first four bytes are the
+    little-endian number of the next free block), followed by memo entries
+    starting at block 1.  Every entry is the encoded text plus two 0x1A
+    bytes, padded with more 0x1A bytes to a whole number of blocks, so the
+    next entry always starts on a fresh block.
+    """
+
+    ext = ".dbt"
+    ExceptionClass = dbfFileException
+
+    def __init__(
+        self,
+        dbt: str | PathLike[Any] | WriteSeekableBinStream,
+        *,
+        encoding: str = "utf-8",
+        encodingErrors: str = "strict",
+    ):
+        super().__init__(file=dbt)
+
+        self.encoding = encoding
+        self.encodingErrors = encodingErrors
+
+        # Block numbers start at 1 (block 0 is this header)
+        self.next_free_block = 1
+        self._header_written = False
+
+    def _write_header(self) -> None:
+        f = self.file
+        f.seek(0)
+        f.write(pack("<I", self.next_free_block))
+        f.write(b"\x00" * (MEMO_BLOCK_SIZE - 4))
+        self._header_written = True
+
+    def _header(self) -> None:
+        # Called by close(): always leave a valid block-0 header behind,
+        # even if no memo entries were ever written.
+        if not self._header_written:
+            self._write_header()
+
+    def write_memo(self, text: str) -> int:
+        """Appends one memo entry and returns its first block number."""
+        if not isinstance(text, str):
+            text = str(text)
+        encoded = text.encode(self.encoding, self.encodingErrors)
+        body = encoded + MEMO_TERMINATOR
+
+        n_blocks = (len(body) + MEMO_BLOCK_SIZE - 1) // MEMO_BLOCK_SIZE
+        start_block = self.next_free_block
+
+        if not self._header_written:
+            self._write_header()
+
+        f = self.file
+        f.seek(start_block * MEMO_BLOCK_SIZE)
+        f.write(body)
+        # Pad the last block so the file ends on a block boundary and the
+        # next entry starts on a fresh block.
+        remainder = n_blocks * MEMO_BLOCK_SIZE - len(body)
+        if remainder:
+            f.write(b"\x1a" * remainder)
+
+        self.next_free_block = start_block + n_blocks
+        # Keep the next-free-block pointer in block 0 up to date.
+        f.seek(0)
+        f.write(pack("<I", self.next_free_block))
+
+        return start_block
+
+
 class DbfWriter(_HasCheckedWriteableFile):
     """Writes .dbf files (dBASE database files), in particular those of Shapefiles."""
 
@@ -4285,6 +4478,7 @@ class DbfWriter(_HasCheckedWriteableFile):
         encodingErrors: str = "strict",
         max_num_fields: int = 2046,
         strict: bool = False,
+        dbt: WriteSeekableBinStream | None = None,
         # Keep kwargs even though unused, to preserve PyShp 2.4 API
         **kwargs: Any,
     ):
@@ -4299,12 +4493,71 @@ class DbfWriter(_HasCheckedWriteableFile):
         self.recNum = 0
         self._is_utf8 = encoding.replace("-", "").replace("_", "").lower() == "utf8"
 
+        # User-supplied file object for the .dbt (caller-owned).  If None and
+        # 'dbf' itself is a path, a sibling .dbt is created on demand.
+        self._dbt_file: WriteSeekableBinStream | None = dbt
+        self._dbt_writer: DbtWriter | None = None
+        # Set when a table with 'M' fields has nowhere to write its .dbt:
+        # record writing is rejected with dbfFileException and close() then
+        # only cleans up, instead of raising the same error a second time.
+        self._dbt_sink_missing = False
+
         (
             self._BOM,
             self._decoded_ascii_spaces,
             self._decoded_mixed_bytes,
             self._decoded_null_bytes,
         ) = _BOM_and_dbf_decoded_pad_bytes(b" ", encoding)
+
+    @property
+    def has_memo_fields(self) -> bool:
+        return any(
+            field.field_type == FieldType.M and field.name != "DeletionFlag"
+            for field in self.fields
+        )
+
+    def _get_dbt_writer(self) -> DbtWriter:
+        """Lazily creates the .dbt writer for tables containing 'M' fields.
+
+        A sibling .dbt path is derived when the .dbf was given as a path.
+        Raises dbfFileException if there is nowhere to write memo text,
+        so contents are never silently discarded.
+        """
+        if self._dbt_writer is None:
+            dbt_file: str | PathLike[Any] | WriteSeekableBinStream | None
+            dbt_file = self._dbt_file
+            if dbt_file is None and isinstance(self._file, Path):
+                # Write a sibling .dbt next to a path-based .dbf
+                dbt_file = self._file.with_suffix(".dbt")
+            if dbt_file is None:
+                self._dbt_sink_missing = True
+                raise dbfFileException(
+                    "The .dbf table contains a Memo ('M') field but no .dbt "
+                    "file was supplied. Pass a writable file object as the "
+                    "'dbt' keyword, or give a target/dbf filepath so a "
+                    "sibling .dbt file can be created."
+                )
+            self._dbt_writer = DbtWriter(
+                dbt_file,
+                encoding=self.encoding,
+                encodingErrors=self.encodingErrors,
+            )
+            # Files opened by DbtWriter itself are pushed onto *its* exit
+            # stack; entering the writer here ensures the header is written
+            # on close, while user-supplied file objects stay caller-owned.
+            self.exit_stack.enter_context(self._dbt_writer)
+        return self._dbt_writer
+
+    def close(self) -> None:
+        if self._dbt_sink_missing:
+            # Record writing was already rejected because there is nowhere
+            # to put the .dbt, so neither a header nor records were written.
+            # Only clean up here instead of raising the error again.
+            if self.is_open():
+                _try_to_flush_file_obj(self.file)
+            self.exit_stack.close()
+            return
+        super().close()
 
     def field(
         # Types of args should match *Field
@@ -4334,11 +4587,28 @@ class DbfWriter(_HasCheckedWriteableFile):
         """Writes the dbf header and field descriptors."""
         f = self.file
         f.seek(0)
-        version = 3
         year, month, day = time.localtime()[:3]
         year -= 1900
+
+        # dBASE III memo pointers always occupy 10 bytes, regardless of the
+        # width requested when the 'M' field was defined.
+        self.fields = [
+            field._replace(size=MEMO_FIELD_SIZE, decimal=0)
+            if field.field_type == FieldType.M and field.name != "DeletionFlag"
+            else field
+            for field in self.fields
+        ]
+
         # Get all fields, ignoring DeletionFlag if specified
         fields = [field for field in self.fields if field.name != "DeletionFlag"]
+
+        has_memo = self.has_memo_fields
+        if has_memo:
+            # Raises dbfFileException if there is nowhere to write memos.
+            # Also ensures the .dbt is created (with its block-0 header)
+            # even if no records are ever written.
+            self._get_dbt_writer()
+        version = DBF_VERSION | (DBF_MEMO_VERSION_FLAG if has_memo else 0)
         # Ensure has at least one field
         if not fields:
             raise dbfFileException(
@@ -4489,8 +4759,21 @@ class DbfWriter(_HasCheckedWriteableFile):
                 else:
                     str_val = " "  # unknown is set to space
 
-            if str_val is None:
-                # Types C and M, and anything else, value is forced to string.
+            if fieldType == "M":
+                # Memo: store only the 10-byte, right-justified starting
+                # block number of the text written to the .dbt file.
+                if value in MISSING:
+                    # No text is written to the .dbt and the pointer is blank;
+                    # the value reads back as None.
+                    encoded = b" " * MEMO_FIELD_SIZE
+                else:
+                    dbt_writer = self._get_dbt_writer()
+                    if not isinstance(value, str):
+                        value = str(value)
+                    block = dbt_writer.write_memo(cast(str, value))
+                    encoded = str(block).encode("ascii").rjust(MEMO_FIELD_SIZE)
+            elif str_val is None:
+                # Type C, and anything else, value is forced to string.
                 str_val = str(value)
 
                 encoded = str_val.encode(self.encoding, self.encodingErrors)
@@ -4876,6 +5159,7 @@ class Writer(_HasExitStack):
         shp: WriteSeekableBinStream | None = None,
         shx: WriteSeekableBinStream | None = None,
         dbf: WriteSeekableBinStream | None = None,
+        dbt: WriteSeekableBinStream | None = None,
         # Keep kwargs even though unused, to preserve PyShp 2.4 API
         **kwargs: Any,
     ) -> None:
@@ -4900,11 +5184,11 @@ class Writer(_HasExitStack):
         self._dbf_writer: DbfWriter | None = None
         self.exit_stack = ExitStack()
         if target is not None:
-            if shp or shx or dbf:
+            if shp or shx or dbf or dbt:
                 raise TypeError(
                     "Unused kwargs were silently ignored by previous versions of PyShp. "
                     "Either specify target (first positional only arg), "
-                    "or shp and/or dbf, possibly plus shx"
+                    "or shp and/or dbf, possibly plus shx and dbt"
                 )
             self._shp = target.with_suffix(".shp")
             self._shx = target.with_suffix(".shx")
@@ -4912,6 +5196,11 @@ class Writer(_HasExitStack):
         elif not (shp or shx or dbf):
             raise TypeError(
                 "Either the target filepath, or any of shp, shx, or dbf must be set to create a shapefile."
+            )
+        if dbt is not None and not self._dbf:
+            raise ShapefileException(
+                "A dbt file object is only usable together with a dbf file "
+                f"(or a target filepath). Got: dbt={dbt}, dbf={self._dbf}"
             )
         if self._shp:
             self._shp_writer = ShpWriter(shp=self._shp, shapeType=shapeType)
@@ -4930,6 +5219,7 @@ class Writer(_HasExitStack):
                 encoding=encoding,
                 encodingErrors=encodingErrors,
                 strict=strict,
+                dbt=dbt,
             )
             self.exit_stack.enter_context(self._dbf_writer)
 
@@ -4968,6 +5258,10 @@ class Writer(_HasExitStack):
     @property
     def dbf(self) -> WriteSeekableBinStream:
         return self.dbf_writer.file
+
+    @property
+    def dbt(self) -> WriteSeekableBinStream:
+        return self.dbf_writer._get_dbt_writer().file
 
     @property
     def fields(self) -> list[Field]:
